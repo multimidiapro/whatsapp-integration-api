@@ -1,5 +1,5 @@
 const express = require('express');
-const { Client } = require('whatsapp-web.js');
+const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const cors = require('cors');
 const http = require('http');
@@ -17,86 +17,98 @@ const io = socketIo(server, {
 app.use(cors());
 app.use(express.json());
 
-// Rota básica para verificar se o servidor está online
-app.get('/', (req, res) => {
-  res.json({ status: 'Server is running' });
+let client;
+let clientReady = false;
+
+// Rota de status
+app.get('/status', (req, res) => {
+  console.log('Status requisitado. Cliente pronto:', clientReady);
+  res.json({ 
+    status: 'online',
+    connected: clientReady,
+    timestamp: new Date().toISOString()
+  });
 });
 
-const client = new Client({
-  puppeteer: {
-    headless: true,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-accelerated-2d-canvas',
-      '--no-first-run',
-      '--no-zygote',
-      '--single-process',
-      '--disable-gpu'
-    ]
+// Rota de reconexão
+app.post('/reconnect', async (req, res) => {
+  console.log('Reconexão solicitada');
+  try {
+    if (client) {
+      await client.destroy();
+    }
+    initializeWhatsApp();
+    res.json({ status: 'reconnecting' });
+  } catch (error) {
+    console.error('Erro na reconexão:', error);
+    res.status(500).json({ error: error.message });
   }
 });
 
-let isReady = false;
-
-client.on('qr', (qr) => {
-  console.log('QR Code gerado:', qr);
-  qrcode.generate(qr, {small: true});
-  io.emit('qr', qr);
-});
-
-client.on('ready', () => {
-  console.log('Cliente WhatsApp está pronto!');
-  isReady = true;
-  io.emit('ready');
-});
-
-client.on('message', async (message) => {
-  console.log('Mensagem recebida:', message);
-  io.emit('message', message);
-});
-
-client.on('disconnected', (reason) => {
-  console.log('Cliente WhatsApp desconectado:', reason);
-  isReady = false;
-  io.emit('disconnected', reason);
-  // Tentar reconectar
-  client.initialize();
-});
-
-// Rota para verificar status
-app.get('/status', (req, res) => {
-  res.json({ 
-    status: isReady ? 'CONNECTED' : 'DISCONNECTED',
-    serverTime: new Date().toISOString()
+function initializeWhatsApp() {
+  console.log('Iniciando cliente WhatsApp...');
+  
+  client = new Client({
+    authStrategy: new LocalAuth(),
+    puppeteer: {
+      args: ['--no-sandbox', '--disable-setuid-sandbox']
+    }
   });
-});
 
-// Rota para forçar reconexão
-app.post('/reconnect', (req, res) => {
-  console.log('Tentando reconectar...');
-  client.initialize().catch(err => {
-    console.error('Erro ao reconectar:', err);
+  client.on('qr', (qr) => {
+    console.log('QR Code gerado');
+    io.emit('qr', qr);
   });
-  res.json({ status: 'Reconnecting' });
+
+  client.on('ready', () => {
+    console.log('Cliente WhatsApp pronto!');
+    clientReady = true;
+    io.emit('ready');
+  });
+
+  client.on('authenticated', () => {
+    console.log('Cliente autenticado');
+    io.emit('authenticated');
+  });
+
+  client.on('auth_failure', (error) => {
+    console.error('Falha na autenticação:', error);
+    clientReady = false;
+    io.emit('auth_failure', error.message);
+  });
+
+  client.on('disconnected', (reason) => {
+    console.log('Cliente desconectado:', reason);
+    clientReady = false;
+    io.emit('disconnected', reason);
+  });
+
+  client.initialize().catch(error => {
+    console.error('Erro ao inicializar cliente:', error);
+    io.emit('error', error.message);
+  });
+}
+
+io.on('connection', (socket) => {
+  console.log('Nova conexão socket estabelecida');
+  
+  if (!client) {
+    console.log('Iniciando WhatsApp pela primeira vez...');
+    initializeWhatsApp();
+  } else if (!clientReady) {
+    console.log('Cliente não está pronto, reiniciando...');
+    initializeWhatsApp();
+  } else {
+    console.log('Cliente já está pronto');
+    socket.emit('ready');
+  }
+
+  socket.on('disconnect', () => {
+    console.log('Cliente socket desconectado');
+  });
 });
 
 const PORT = process.env.PORT || 3000;
-
-// Tratamento de erros global
-process.on('uncaughtException', (err) => {
-  console.error('Erro não tratado:', err);
-});
-
-process.on('unhandledRejection', (err) => {
-  console.error('Promise rejeitada não tratada:', err);
-});
-
 server.listen(PORT, () => {
   console.log(`Servidor rodando na porta ${PORT}`);
-  console.log('Iniciando cliente WhatsApp...');
-  client.initialize().catch(err => {
-    console.error('Erro ao inicializar cliente WhatsApp:', err);
-  });
-}); 
+});
